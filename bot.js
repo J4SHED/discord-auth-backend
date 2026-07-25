@@ -24,7 +24,7 @@ const client = new Client({
 
 // Configure Role IDs
 const EXE_ROLE_ID = process.env.EXE_ROLE_ID || '1530696299358191706';
-const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID || 'YOUR_ADMIN_ROLE_ID_HERE'; // Replace or set in .env
+const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID || '1488588617503867070'; // Replace or set in .env
 
 // Register Slash Commands (/panel & /admin)
 const commands = [
