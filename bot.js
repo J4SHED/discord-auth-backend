@@ -334,7 +334,7 @@ client.on('interactionCreate', async interaction => {
             });
         }
     }
-
+    
     // 3. Button Interactions
     if (interaction.isButton()) {
         const customId = interaction.customId;
@@ -461,5 +461,26 @@ client.on('interactionCreate', async interaction => {
         }
     }
 });
+client.once('clientReady', async () => {
+    console.log(`🤖 Discord Bot online as ${client.user.tag}`);
 
+    // Auto-migrate missing columns if they don't exist
+    try {
+        await db.execute('ALTER TABLE users ADD COLUMN last_renewal_at TEXT;');
+    } catch (e) { /* Column already exists */ }
+    
+    try {
+        await db.execute('ALTER TABLE users ADD COLUMN daily_renewal_count INTEGER DEFAULT 0;');
+    } catch (e) { /* Column already exists */ }
+
+    try {
+        await rest.put(
+            Routes.applicationCommands(process.env.DISCORD_CLIENT_ID),
+            { body: commands }
+        );
+        console.log('✅ Slash commands (/panel, /admin) registered globally.');
+    } catch (error) {
+        console.error('Error registering slash commands:', error);
+    }
+});
 client.login(process.env.DISCORD_BOT_TOKEN);
