@@ -25,6 +25,7 @@ const client = new Client({
 
 // Configure Role IDs
 const EXE_ROLE_ID = process.env.EXE_ROLE_ID || '1530696299358191706';
+const EXE_PREMIUM_ROLE_ID = process.env.EXE_PREMIUM_ROLE_ID || 'YOUR_EXE_PREMIUM_ROLE_ID_HERE'; // Set in .env or paste here
 const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID || '1488588617503867070'; 
 
 // Register Slash Commands (/panel & /admin)
@@ -53,6 +54,9 @@ const commands = [
                .setDescription('Extend trial by custom hours')
                .addStringOption(opt => opt.setName('username').setDescription('Target username').setRequired(true))
                .addIntegerOption(opt => opt.setName('hours').setDescription('Hours to add').setRequired(true)))
+        .addSubcommand(sub =>
+            sub.setName('list')
+               .setDescription('View a list of all registered users and their details'))
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
@@ -87,14 +91,14 @@ function createPanelComponents(row) {
             { name: 'Username', value: `\`${row.username}\``, inline: true },
             { name: 'Status', value: status === 'banned' ? '⛔ Banned' : (isExpired ? '❌ Expired' : '✅ Active'), inline: true },
             { name: 'Trial Expiry', value: `<t:${unixTimestamp}:F> (<t:${unixTimestamp}:R>)`, inline: false },
-            { name: 'Renewals Used', value: `\`${row.renewal_count}\``, inline: true }
+            { name: 'Total Renewals Used', value: `\`${row.renewal_count || 0}\``, inline: true }
         )
         .setFooter({ text: 'JASH Authentication System' })
         .setTimestamp();
 
     const renewButton = new ButtonBuilder()
         .setCustomId('renew_trial')
-        .setLabel('🔄 Renew Trial (+2 Days)')
+        .setLabel('🔄 Renew Trial (+1 Day)')
         .setStyle(ButtonStyle.Success)
         .setDisabled(status === 'banned');
 
@@ -162,9 +166,48 @@ client.on('interactionCreate', async interaction => {
         }
 
         const subcommand = interaction.options.getSubcommand();
-        const username = interaction.options.getString('username');
 
         try {
+            // --- ADMIN LIST USERS ---
+            if (subcommand === 'list') {
+                const usersRes = await db.execute('SELECT * FROM users');
+                const users = usersRes.rows;
+
+                if (users.length === 0) {
+                    return interaction.reply({
+                        content: 'ℹ️ No users found in the database.',
+                        flags: MessageFlags.Ephemeral
+                    });
+                }
+
+                const listEmbed = new EmbedBuilder()
+                    .setTitle('📋 Registered Users List')
+                    .setColor(0x3498DB)
+                    .setFooter({ text: `Total Users: ${users.length}` })
+                    .setTimestamp();
+
+                // Format each user details cleanly
+                users.slice(0, 25).forEach(u => {
+                    const expiryUnix = u.trial_expiry ? Math.floor(new Date(u.trial_expiry).getTime() / 1000) : null;
+                    const expiryStr = expiryUnix ? `<t:${expiryUnix}:R>` : 'N/A';
+                    const discordTag = u.discord_id ? `<@${u.discord_id}>` : 'Not Linked';
+                    const statusTag = u.status === 'banned' ? '⛔ Banned' : '✅ Active';
+
+                    listEmbed.addFields({
+                        name: `👤 ${u.username}`,
+                        value: `• **Discord:** ${discordTag}\n• **Status:** ${statusTag}\n• **Expiry:** ${expiryStr}\n• **Renewals:** \`${u.renewal_count || 0}\``,
+                        inline: true
+                    });
+                });
+
+                return interaction.reply({
+                    embeds: [listEmbed],
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+            const username = interaction.options.getString('username');
+
             // Find target user by username
             const userRes = await db.execute({
                 sql: 'SELECT * FROM users WHERE username = ?',
@@ -246,13 +289,17 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // 3. Button Interactions (User Renewal)
+    // 3. Button Interactions (User Renewal with Role Limits)
     if (interaction.isButton() && interaction.customId === 'renew_trial') {
         const member = interaction.member;
 
-        if (!member.roles.cache.has(EXE_ROLE_ID)) {
+        const hasExe = member.roles.cache.has(EXE_ROLE_ID);
+        const hasPremium = EXE_PREMIUM_ROLE_ID !== 'YOUR_EXE_PREMIUM_ROLE_ID_HERE' && member.roles.cache.has(EXE_PREMIUM_ROLE_ID);
+
+        // Check Role Permission
+        if (!hasExe && !hasPremium) {
             return interaction.reply({
-                content: `⛔ You need the <@&${EXE_ROLE_ID}> role to renew your trial!`,
+                content: `⛔ You need either the <@&${EXE_ROLE_ID}> or Premium role to renew your trial!`,
                 flags: MessageFlags.Ephemeral
             });
         }
@@ -269,14 +316,41 @@ client.on('interactionCreate', async interaction => {
             if (!row) return interaction.reply({ content: '❌ Account not found.', flags: MessageFlags.Ephemeral });
 
             const now = new Date();
+            const lastRenewal = row.last_renewal_at ? new Date(row.last_renewal_at) : null;
+            const dailyCount = Number(row.daily_renewal_count || 0);
+
+            // Determine limit based on role (Premium: 3 per 24 hours, Normal EXE: 1 per 24 hours)
+            const maxRenewalsAllowed = hasPremium ? 3 : 1;
+
+            let currentDailyCount = dailyCount;
+
+            // Reset counter if more than 24 hours have passed since last renewal
+            if (lastRenewal && (now.getTime() - lastRenewal.getTime()) > (24 * 60 * 60 * 1000)) {
+                currentDailyCount = 0;
+            }
+
+            // Check Cooldown Limit
+            if (currentDailyCount >= maxRenewalsAllowed) {
+                const resetTime = new Date(lastRenewal.getTime() + (24 * 60 * 60 * 1000));
+                const resetUnix = Math.floor(resetTime.getTime() / 1000);
+
+                return interaction.reply({
+                    content: `⏳ **Cooldown Active!**\nYou have reached your maximum renewals (${maxRenewalsAllowed}/24 hrs).\nYou can renew again <t:${resetUnix}:R>.`,
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+            // Process Renewal (+1 Day / 24 Hours)
             const currentExpiry = new Date(row.trial_expiry);
             const baseTime = now > currentExpiry ? now : currentExpiry;
-            const newExpiry = new Date(baseTime.getTime() + (2 * 24 * 60 * 60 * 1000));
-            const newRenewalCount = Number(row.renewal_count || 0) + 1;
+            const newExpiry = new Date(baseTime.getTime() + (24 * 60 * 60 * 1000));
+
+            const totalRenewalCount = Number(row.renewal_count || 0) + 1;
+            const updatedDailyCount = currentDailyCount + 1;
 
             await db.execute({
-                sql: 'UPDATE users SET trial_expiry = ?, renewal_count = ? WHERE discord_id = ?',
-                args: [newExpiry.toISOString(), newRenewalCount, userId]
+                sql: 'UPDATE users SET trial_expiry = ?, renewal_count = ?, last_renewal_at = ?, daily_renewal_count = ? WHERE discord_id = ?',
+                args: [newExpiry.toISOString(), totalRenewalCount, now.toISOString(), updatedDailyCount, userId]
             });
 
             const updatedResult = await db.execute({
@@ -287,7 +361,7 @@ client.on('interactionCreate', async interaction => {
             const { embed, rowComponent } = createPanelComponents(updatedResult.rows[0]);
 
             return interaction.update({
-                content: '✅ **Trial extended by +2 days!**',
+                content: `✅ **Trial extended by +1 day!** (${updatedDailyCount}/${maxRenewalsAllowed} renewals used today)`,
                 embeds: [embed],
                 components: [rowComponent]
             });
