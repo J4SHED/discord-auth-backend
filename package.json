@@ -18,6 +18,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@libsql/client": "^0.17.4",
     "axios": "^1.18.1",
     "cors": "^2.8.6",
     "discord.js": "^14.27.0",
