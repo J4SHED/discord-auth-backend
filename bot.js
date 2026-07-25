@@ -9,7 +9,7 @@ const {
     ActionRowBuilder, 
     ButtonBuilder, 
     ButtonStyle,
-    MessageFlags // Imported to fix the deprecation warning
+    MessageFlags 
 } = require('discord.js');
 const { createClient } = require('@libsql/client');
 
@@ -32,13 +32,27 @@ const commands = [
     new SlashCommandBuilder()
         .setName('panel')
         .setDescription('Open the User Control Panel to check trial status or renew'),
+    
     new SlashCommandBuilder()
         .setName('admin')
-        .setDescription('Admin Panel: Manage user accounts (Admin Only)')
-        .addUserOption(option => 
-            option.setName('target')
-                .setDescription('The user to manage')
-                .setRequired(true))
+        .setDescription('Admin Panel: Manage user accounts')
+        .addSubcommand(sub => 
+            sub.setName('ban')
+               .setDescription('Ban a user by username')
+               .addStringOption(opt => opt.setName('username').setDescription('Target username').setRequired(true)))
+        .addSubcommand(sub => 
+            sub.setName('unban')
+               .setDescription('Unban a user by username')
+               .addStringOption(opt => opt.setName('username').setDescription('Target username').setRequired(true)))
+        .addSubcommand(sub => 
+            sub.setName('endtrial')
+               .setDescription('End trial immediately for a user')
+               .addStringOption(opt => opt.setName('username').setDescription('Target username').setRequired(true)))
+        .addSubcommand(sub => 
+            sub.setName('extendtrial')
+               .setDescription('Extend trial by custom hours')
+               .addStringOption(opt => opt.setName('username').setDescription('Target username').setRequired(true))
+               .addIntegerOption(opt => opt.setName('hours').setDescription('Hours to add').setRequired(true)))
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
@@ -89,10 +103,10 @@ function createPanelComponents(row) {
     return { embed, rowComponent, status };
 }
 
-// Handle Slash Commands and Button Interactions
+// Handle Interactions
 client.on('interactionCreate', async interaction => {
 
-    // 1. /panel Command (User Panel)
+    // 1. /panel Command
     if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
         const userId = interaction.user.id;
 
@@ -135,159 +149,152 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // 2. /admin Command (Admin Controls)
+    // 2. /admin Subcommands
     if (interaction.isChatInputCommand() && interaction.commandName === 'admin') {
         const member = interaction.member;
 
-        // Check if caller has the Admin Role
-        if (ADMIN_ROLE_ID !== 'YOUR_ADMIN_ROLE_ID_HERE' && !member.roles.cache.has(ADMIN_ROLE_ID)) {
+        // Check if caller has Admin Role
+        if (!member.roles.cache.has(ADMIN_ROLE_ID)) {
             return interaction.reply({
-                content: '⛔ You do not have permission to use admin commands.',
+                content: '⛔ You do not have permission to run admin commands.',
                 flags: MessageFlags.Ephemeral
             });
         }
 
-        const targetUser = interaction.options.getUser('target');
+        const subcommand = interaction.options.getSubcommand();
+        const username = interaction.options.getString('username');
+
+        try {
+            // Find target user by username
+            const userRes = await db.execute({
+                sql: 'SELECT * FROM users WHERE username = ?',
+                args: [username]
+            });
+
+            const user = userRes.rows[0];
+            if (!user) {
+                return interaction.reply({
+                    content: `❌ No user found in the database with username: **\`${username}\`**`,
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+            // --- ADMIN BAN ---
+            if (subcommand === 'ban') {
+                await db.execute({
+                    sql: 'UPDATE users SET status = ? WHERE username = ?',
+                    args: ['banned', username]
+                });
+                return interaction.reply({
+                    content: `⛔ **\`${username}\`** has been successfully **banned**.`,
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+            // --- ADMIN UNBAN ---
+            if (subcommand === 'unban') {
+                await db.execute({
+                    sql: 'UPDATE users SET status = ? WHERE username = ?',
+                    args: ['active', username]
+                });
+                return interaction.reply({
+                    content: `✅ **\`${username}\`** has been successfully **unbanned**.`,
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+            // --- ADMIN END TRIAL ---
+            if (subcommand === 'endtrial') {
+                const nowIso = new Date().toISOString();
+                await db.execute({
+                    sql: 'UPDATE users SET trial_expiry = ? WHERE username = ?',
+                    args: [nowIso, username]
+                });
+                return interaction.reply({
+                    content: `⏳ Trial for **\`${username}\`** has been ended immediately.`,
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+            // --- ADMIN EXTEND TRIAL (Custom Hours) ---
+            if (subcommand === 'extendtrial') {
+                const hoursToAdd = interaction.options.getInteger('hours');
+                const currentExpiry = new Date(user.trial_expiry);
+                const baseTime = new Date() > currentExpiry ? new Date() : currentExpiry;
+                
+                const newExpiry = new Date(baseTime.getTime() + (hoursToAdd * 60 * 60 * 1000));
+
+                await db.execute({
+                    sql: 'UPDATE users SET trial_expiry = ? WHERE username = ?',
+                    args: [newExpiry.toISOString(), username]
+                });
+
+                const unixTimestamp = Math.floor(newExpiry.getTime() / 1000);
+
+                return interaction.reply({
+                    content: `✅ Extended trial for **\`${username}\`** by **${hoursToAdd} hours**.\nNew Expiry: <t:${unixTimestamp}:F> (<t:${unixTimestamp}:R>)`,
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
+        } catch (err) {
+            console.error('Admin Subcommand Error:', err);
+            return interaction.reply({
+                content: '⚠️ An error occurred while processing the admin command.',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+    }
+
+    // 3. Button Interactions (User Renewal)
+    if (interaction.isButton() && interaction.customId === 'renew_trial') {
+        const member = interaction.member;
+
+        if (!member.roles.cache.has(EXE_ROLE_ID)) {
+            return interaction.reply({
+                content: `⛔ You need the <@&${EXE_ROLE_ID}> role to renew your trial!`,
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        const userId = interaction.user.id;
 
         try {
             const result = await db.execute({
                 sql: 'SELECT * FROM users WHERE discord_id = ?',
-                args: [targetUser.id]
+                args: [userId]
             });
 
             const row = result.rows[0];
+            if (!row) return interaction.reply({ content: '❌ Account not found.', flags: MessageFlags.Ephemeral });
 
-            if (!row) {
-                return interaction.reply({
-                    content: `❌ User <@${targetUser.id}> has no record in the database.`,
-                    flags: MessageFlags.Ephemeral
-                });
-            }
+            const now = new Date();
+            const currentExpiry = new Date(row.trial_expiry);
+            const baseTime = now > currentExpiry ? now : currentExpiry;
+            const newExpiry = new Date(baseTime.getTime() + (2 * 24 * 60 * 60 * 1000));
+            const newRenewalCount = Number(row.renewal_count || 0) + 1;
 
-            const trialExpiry = new Date(row.trial_expiry);
-            const unixTimestamp = Math.floor(trialExpiry.getTime() / 1000);
+            await db.execute({
+                sql: 'UPDATE users SET trial_expiry = ?, renewal_count = ? WHERE discord_id = ?',
+                args: [newExpiry.toISOString(), newRenewalCount, userId]
+            });
 
-            const adminEmbed = new EmbedBuilder()
-                .setTitle('⚙️ Admin Control Panel')
-                .setColor(0x3498DB)
-                .addFields(
-                    { name: 'Target User', value: `<@${targetUser.id}> (\`${row.username}\`)`, inline: false },
-                    { name: 'Status', value: row.status === 'banned' ? '⛔ Banned' : '✅ Active', inline: true },
-                    { name: 'Trial Expiry', value: `<t:${unixTimestamp}:F>`, inline: false },
-                    { name: 'Renewals Used', value: `\`${row.renewal_count}\``, inline: true }
-                );
+            const updatedResult = await db.execute({
+                sql: 'SELECT * FROM users WHERE discord_id = ?',
+                args: [userId]
+            });
 
-            const banBtn = new ButtonBuilder()
-                .setCustomId(`admin_ban_${targetUser.id}`)
-                .setLabel(row.status === 'banned' ? 'Unban User' : 'Ban User')
-                .setStyle(row.status === 'banned' ? ButtonStyle.Success : ButtonStyle.Danger);
+            const { embed, rowComponent } = createPanelComponents(updatedResult.rows[0]);
 
-            const resetBtn = new ButtonBuilder()
-                .setCustomId(`admin_reset_${targetUser.id}`)
-                .setLabel('Reset Trial (+2 Days)')
-                .setStyle(ButtonStyle.Primary);
-
-            const actionRow = new ActionRowBuilder().addComponents(banBtn, resetBtn);
-
-            return interaction.reply({
-                embeds: [adminEmbed],
-                components: [actionRow],
-                flags: MessageFlags.Ephemeral
+            return interaction.update({
+                content: '✅ **Trial extended by +2 days!**',
+                embeds: [embed],
+                components: [rowComponent]
             });
 
         } catch (err) {
-            console.error('Admin Command Error:', err);
-            return interaction.reply({ content: '⚠️ Error executing admin command.', flags: MessageFlags.Ephemeral });
-        }
-    }
-
-    // 3. Handle Button Interactions
-    if (interaction.isButton()) {
-        const customId = interaction.customId;
-        const member = interaction.member;
-
-        // --- RENEW TRIAL BUTTON (EXE Role check) ---
-        if (customId === 'renew_trial') {
-            if (!member.roles.cache.has(EXE_ROLE_ID)) {
-                return interaction.reply({
-                    content: `⛔ You need the <@&${EXE_ROLE_ID}> role to renew your trial!`,
-                    flags: MessageFlags.Ephemeral
-                });
-            }
-
-            const userId = interaction.user.id;
-
-            try {
-                const result = await db.execute({
-                    sql: 'SELECT * FROM users WHERE discord_id = ?',
-                    args: [userId]
-                });
-
-                const row = result.rows[0];
-                if (!row) return interaction.reply({ content: '❌ Account not found.', flags: MessageFlags.Ephemeral });
-
-                const now = new Date();
-                const currentExpiry = new Date(row.trial_expiry);
-                const baseTime = now > currentExpiry ? now : currentExpiry;
-                const newExpiry = new Date(baseTime.getTime() + (2 * 24 * 60 * 60 * 1000));
-                const newRenewalCount = Number(row.renewal_count || 0) + 1;
-
-                await db.execute({
-                    sql: 'UPDATE users SET trial_expiry = ?, renewal_count = ? WHERE discord_id = ?',
-                    args: [newExpiry.toISOString(), newRenewalCount, userId]
-                });
-
-                const updatedResult = await db.execute({
-                    sql: 'SELECT * FROM users WHERE discord_id = ?',
-                    args: [userId]
-                });
-
-                const { embed, rowComponent } = createPanelComponents(updatedResult.rows[0]);
-
-                return interaction.update({
-                    content: '✅ **Trial extended by +2 days!**',
-                    embeds: [embed],
-                    components: [rowComponent]
-                });
-
-            } catch (err) {
-                console.error('Renewal Error:', err);
-                return interaction.reply({ content: '⚠️ Failed to renew trial.', flags: MessageFlags.Ephemeral });
-            }
-        }
-
-        // --- ADMIN BUTTON ACTIONS (Ban/Unban & Reset) ---
-        if (customId.startsWith('admin_')) {
-            if (ADMIN_ROLE_ID !== 'YOUR_ADMIN_ROLE_ID_HERE' && !member.roles.cache.has(ADMIN_ROLE_ID)) {
-                return interaction.reply({ content: '⛔ Admin permissions required.', flags: MessageFlags.Ephemeral });
-            }
-
-            const targetId = customId.split('_')[2];
-
-            if (customId.startsWith('admin_ban_')) {
-                const current = await db.execute({ sql: 'SELECT status FROM users WHERE discord_id = ?', args: [targetId] });
-                const currentStatus = current.rows[0]?.status || 'active';
-                const newStatus = currentStatus === 'banned' ? 'active' : 'banned';
-
-                await db.execute({ sql: 'UPDATE users SET status = ? WHERE discord_id = ?', args: [newStatus, targetId] });
-
-                return interaction.update({
-                    content: `✅ User status updated to: **${newStatus.toUpperCase()}**`,
-                    embeds: [],
-                    components: []
-                });
-            }
-
-            if (customId.startsWith('admin_reset_')) {
-                const newExpiry = new Date(Date.now() + (2 * 24 * 60 * 60 * 1000));
-                await db.execute({ sql: 'UPDATE users SET trial_expiry = ? WHERE discord_id = ?', args: [newExpiry.toISOString(), targetId] });
-
-                return interaction.update({
-                    content: `✅ Reset trial for <@${targetId}>. New Expiry set to +2 Days.`,
-                    embeds: [],
-                    components: []
-                });
-            }
+            console.error('Renewal Error:', err);
+            return interaction.reply({ content: '⚠️ Failed to renew trial.', flags: MessageFlags.Ephemeral });
         }
     }
 });
