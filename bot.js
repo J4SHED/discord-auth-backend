@@ -8,7 +8,8 @@ const {
     EmbedBuilder, 
     ActionRowBuilder, 
     ButtonBuilder, 
-    ButtonStyle 
+    ButtonStyle,
+    MessageFlags // Imported to fix the deprecation warning
 } = require('discord.js');
 const { createClient } = require('@libsql/client');
 
@@ -24,7 +25,7 @@ const client = new Client({
 
 // Configure Role IDs
 const EXE_ROLE_ID = process.env.EXE_ROLE_ID || '1530696299358191706';
-const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID || '1488588617503867070'; // Replace or set in .env
+const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID || '1488588617503867070'; 
 
 // Register Slash Commands (/panel & /admin)
 const commands = [
@@ -106,7 +107,7 @@ client.on('interactionCreate', async interaction => {
             if (!row) {
                 return interaction.reply({
                     content: '❌ No active account found for your Discord ID. Please log in through the application first.',
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -115,21 +116,21 @@ client.on('interactionCreate', async interaction => {
             if (status === 'banned') {
                 return interaction.reply({
                     content: '⛔ Your account has been banned by an administrator.',
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
             return interaction.reply({ 
                 embeds: [embed], 
                 components: [rowComponent], 
-                ephemeral: true 
+                flags: MessageFlags.Ephemeral 
             });
 
         } catch (err) {
             console.error('Database query error:', err);
             return interaction.reply({
                 content: '⚠️ An error occurred while retrieving your account info.',
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
         }
     }
@@ -142,7 +143,7 @@ client.on('interactionCreate', async interaction => {
         if (ADMIN_ROLE_ID !== 'YOUR_ADMIN_ROLE_ID_HERE' && !member.roles.cache.has(ADMIN_ROLE_ID)) {
             return interaction.reply({
                 content: '⛔ You do not have permission to use admin commands.',
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
         }
 
@@ -159,7 +160,7 @@ client.on('interactionCreate', async interaction => {
             if (!row) {
                 return interaction.reply({
                     content: `❌ User <@${targetUser.id}> has no record in the database.`,
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -191,12 +192,12 @@ client.on('interactionCreate', async interaction => {
             return interaction.reply({
                 embeds: [adminEmbed],
                 components: [actionRow],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
 
         } catch (err) {
             console.error('Admin Command Error:', err);
-            return interaction.reply({ content: '⚠️ Error executing admin command.', ephemeral: true });
+            return interaction.reply({ content: '⚠️ Error executing admin command.', flags: MessageFlags.Ephemeral });
         }
     }
 
@@ -210,7 +211,7 @@ client.on('interactionCreate', async interaction => {
             if (!member.roles.cache.has(EXE_ROLE_ID)) {
                 return interaction.reply({
                     content: `⛔ You need the <@&${EXE_ROLE_ID}> role to renew your trial!`,
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -223,7 +224,7 @@ client.on('interactionCreate', async interaction => {
                 });
 
                 const row = result.rows[0];
-                if (!row) return interaction.reply({ content: '❌ Account not found.', ephemeral: true });
+                if (!row) return interaction.reply({ content: '❌ Account not found.', flags: MessageFlags.Ephemeral });
 
                 const now = new Date();
                 const currentExpiry = new Date(row.trial_expiry);
@@ -251,14 +252,14 @@ client.on('interactionCreate', async interaction => {
 
             } catch (err) {
                 console.error('Renewal Error:', err);
-                return interaction.reply({ content: '⚠️ Failed to renew trial.', ephemeral: true });
+                return interaction.reply({ content: '⚠️ Failed to renew trial.', flags: MessageFlags.Ephemeral });
             }
         }
 
         // --- ADMIN BUTTON ACTIONS (Ban/Unban & Reset) ---
         if (customId.startsWith('admin_')) {
             if (ADMIN_ROLE_ID !== 'YOUR_ADMIN_ROLE_ID_HERE' && !member.roles.cache.has(ADMIN_ROLE_ID)) {
-                return interaction.reply({ content: '⛔ Admin permissions required.', ephemeral: true });
+                return interaction.reply({ content: '⛔ Admin permissions required.', flags: MessageFlags.Ephemeral });
             }
 
             const targetId = customId.split('_')[2];
