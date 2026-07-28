@@ -130,7 +130,7 @@ app.post('/api/auth/discord', async (req, res) => {
 
         return res.json({
             success: true,
-            message: 'Login successful.',
+            message: user.username,
             user: {
                 id: user.id,
                 username: user.username,
