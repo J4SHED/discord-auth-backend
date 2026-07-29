@@ -37,13 +37,25 @@ initDb();
 
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI || 'http://localhost:5000/callback/';
 const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+
+// Allowed redirect URIs
+const ALLOWED_REDIRECT_URIS = [
+    'http://localhost:3000/callback/',
+    'http://localhost:5000/callback/'
+];
 
 // Handle OAuth Request from C# App
 app.post('/api/auth/discord', async (req, res) => {
-    const { code } = req.body;
+    const { code, redirect_uri } = req.body;
     if (!code) return res.status(400).json({ success: false, message: 'Missing auth code.' });
+
+    // Determine target redirect_uri dynamically
+    let targetRedirectUri = process.env.REDIRECT_URI || 'http://localhost:5000/callback/';
+
+    if (redirect_uri && ALLOWED_REDIRECT_URIS.includes(redirect_uri)) {
+        targetRedirectUri = redirect_uri;
+    }
 
     try {
         const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({
@@ -51,7 +63,7 @@ app.post('/api/auth/discord', async (req, res) => {
             client_secret: DISCORD_CLIENT_SECRET,
             grant_type: 'authorization_code',
             code: code,
-            redirect_uri: REDIRECT_URI
+            redirect_uri: targetRedirectUri
         }), {
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
         });
@@ -141,7 +153,11 @@ app.post('/api/auth/discord', async (req, res) => {
 
     } catch (error) {
         console.error("Auth Error:", error.response?.data || error.message);
-        return res.status(500).json({ success: false, message: 'Authentication failed.' });
+        return res.status(500).json({ 
+            success: false, 
+            message: 'Authentication failed.',
+            details: error.response?.data || error.message 
+        });
     }
 });
 
