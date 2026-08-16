@@ -1,192 +1,377 @@
 require('dotenv').config();
+
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { createClient } = require('@libsql/client');
 
 const app = express();
+
 app.use(express.json());
 app.use(cors());
 
-// Connect to Turso Cloud DB (or fallback to local sqlite file)
 const db = createClient({
     url: process.env.TURSO_DATABASE_URL || "file:database.db",
     authToken: process.env.TURSO_AUTH_TOKEN
 });
 
-// Initialize Table
-async function initDb() {
-    try {
-        await db.execute(`
-            CREATE TABLE IF NOT EXISTS users (
-                discord_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                trial_start DATETIME NOT NULL,
-                trial_expiry DATETIME NOT NULL,
-                renewal_count INTEGER DEFAULT 0,
-                last_login DATETIME NOT NULL,
-                status TEXT DEFAULT 'active'
-            )
-        `);
-        console.log("Connected and initialized DB.");
-    } catch (err) {
-        console.error("Database initialization error:", err);
-    }
-}
-initDb();
-
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-// Allowed redirect URIs
-const ALLOWED_REDIRECT_URIS = [
-    'http://localhost:3000/callback/',
-    'http://localhost:5000/callback/'
-];
+const REDIRECT_URI = 'http://localhost:5000/callback/';
 
-// Handle OAuth Request from C# App
-app.post('/api/auth/discord', async (req, res) => {
-    const { code, redirect_uri } = req.body;
-    if (!code) return res.status(400).json({ success: false, message: 'Missing auth code.' });
+async function initDb() {
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS users (
+            discord_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            trial_start TEXT NOT NULL,
+            trial_expiry TEXT NOT NULL,
+            renewal_count INTEGER DEFAULT 0,
+            last_login TEXT NOT NULL,
+            status TEXT DEFAULT 'active'
+        )
+    `);
 
-    // Determine target redirect_uri dynamically
-    let targetRedirectUri = process.env.REDIRECT_URI || 'http://localhost:5000/callback/';
-
-    if (redirect_uri && ALLOWED_REDIRECT_URIS.includes(redirect_uri)) {
-        targetRedirectUri = redirect_uri;
+    try {
+        await db.execute(
+            'ALTER TABLE users ADD COLUMN last_renewal_at TEXT;'
+        );
+    } catch (_) {
     }
 
     try {
-        const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({
-            client_id: DISCORD_CLIENT_ID,
-            client_secret: DISCORD_CLIENT_SECRET,
-            grant_type: 'authorization_code',
-            code: code,
-            redirect_uri: targetRedirectUri
-        }), {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
+        await db.execute(
+            'ALTER TABLE users ADD COLUMN daily_renewal_count INTEGER DEFAULT 0;'
+        );
+    } catch (_) {
+    }
 
-        const accessToken = tokenResponse.data.access_token;
+    console.log("Database initialized.");
+}
 
-        const userResponse = await axios.get('https://discord.com/api/users/@me', {
-            headers: { Authorization: `Bearer ${accessToken}` }
+const dbReady = initDb();
+
+app.get('/health', async (req, res) => {
+    try {
+        await dbReady;
+
+        res.json({
+            success: true,
+            message: 'JASH authentication backend is online.'
         });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Database unavailable.'
+        });
+    }
+});
+
+app.post('/api/auth/discord', async (req, res) => {
+    try {
+        await dbReady;
+
+        const { code, redirect_uri } = req.body;
+
+        if (!code) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing Discord authorization code.'
+            });
+        }
+
+        if (redirect_uri !== REDIRECT_URI) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid redirect URI.'
+            });
+        }
+
+        if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+            console.error('Discord OAuth credentials are missing.');
+
+            return res.status(500).json({
+                success: false,
+                message: 'Discord authentication is not configured.'
+            });
+        }
+
+        const tokenResponse = await axios.post(
+            'https://discord.com/api/v10/oauth2/token',
+            new URLSearchParams({
+                client_id: DISCORD_CLIENT_ID,
+                client_secret: DISCORD_CLIENT_SECRET,
+                grant_type: 'authorization_code',
+                code: code,
+                redirect_uri: REDIRECT_URI
+            }),
+            {
+                headers: {
+                    'Content-Type':
+                        'application/x-www-form-urlencoded'
+                },
+                timeout: 15000
+            }
+        );
+
+        const accessToken =
+            tokenResponse.data.access_token;
+
+        if (!accessToken) {
+            return res.status(401).json({
+                success: false,
+                message: 'Discord did not return an access token.'
+            });
+        }
+
+        const userResponse = await axios.get(
+            'https://discord.com/api/v10/users/@me',
+            {
+                headers: {
+                    Authorization: `Bearer ${accessToken}`
+                },
+                timeout: 15000
+            }
+        );
 
         const user = userResponse.data;
+
+        if (!user || !user.id || !user.username) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid Discord user response.'
+            });
+        }
+
         const now = new Date();
 
-        // Query user from DB
-        const result = await db.execute({
+        const existing = await db.execute({
             sql: 'SELECT * FROM users WHERE discord_id = ?',
             args: [user.id]
         });
 
-        const row = result.rows[0];
-        let trialExpiry;
-        let renewalCount = 0;
-        let status = 'active';
+        let row = existing.rows[0];
 
         if (!row) {
-            // First Time User: 2-Day Trial
-            trialExpiry = new Date(now.getTime() + (2 * 24 * 60 * 60 * 1000));
+            const trialStart = now;
+
+            // First login = 48-hour trial.
+            const trialExpiry =
+                new Date(
+                    now.getTime() +
+                    (48 * 60 * 60 * 1000)
+                );
+
             await db.execute({
-                sql: `INSERT INTO users (discord_id, username, trial_start, trial_expiry, renewal_count, last_login, status) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                args: [user.id, user.username, now.toISOString(), trialExpiry.toISOString(), 0, now.toISOString(), 'active']
+                sql: `
+                    INSERT INTO users
+                    (
+                        discord_id,
+                        username,
+                        trial_start,
+                        trial_expiry,
+                        renewal_count,
+                        last_login,
+                        status,
+                        last_renewal_at,
+                        daily_renewal_count
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `,
+                args: [
+                    user.id,
+                    user.username,
+                    trialStart.toISOString(),
+                    trialExpiry.toISOString(),
+                    0,
+                    now.toISOString(),
+                    'active',
+                    null,
+                    0
+                ]
             });
+
+            row = {
+                discord_id: user.id,
+                username: user.username,
+                trial_start: trialStart.toISOString(),
+                trial_expiry: trialExpiry.toISOString(),
+                renewal_count: 0,
+                last_login: now.toISOString(),
+                status: 'active'
+            };
         } else {
-            trialExpiry = new Date(row.trial_expiry);
-            renewalCount = Number(row.renewal_count);
-            status = row.status || 'active';
             await db.execute({
-                sql: `UPDATE users SET last_login = ?, username = ? WHERE discord_id = ?`,
-                args: [now.toISOString(), user.username, user.id]
+                sql: `
+                    UPDATE users
+                    SET last_login = ?, username = ?
+                    WHERE discord_id = ?
+                `,
+                args: [
+                    now.toISOString(),
+                    user.username,
+                    user.id
+                ]
             });
+
+            row.username = user.username;
+            row.last_login = now.toISOString();
         }
 
-        // Check if user is banned by admin
+        const trialExpiry =
+            new Date(row.trial_expiry);
+
+        const status =
+            row.status || 'active';
+
+        const renewalCount =
+            Number(row.renewal_count || 0);
+
         if (status === 'banned') {
             await sendLogWebhook({
                 discordId: user.id,
                 username: user.username,
                 lastLogin: now.toLocaleString(),
                 trialExpiry: trialExpiry.toLocaleString(),
-                renewalCount: renewalCount,
+                renewalCount,
                 statusText: '⛔ Banned by Admin'
             });
 
             return res.status(403).json({
                 success: false,
-                message: 'Your account has been banned by an administrator.'
+                message:
+                    'Your account has been banned by an administrator.'
             });
         }
 
-        const isExpired = now > trialExpiry;
+        const isExpired =
+            now.getTime() >= trialExpiry.getTime();
 
         await sendLogWebhook({
             discordId: user.id,
             username: user.username,
             lastLogin: now.toLocaleString(),
             trialExpiry: trialExpiry.toLocaleString(),
-            renewalCount: renewalCount,
-            statusText: isExpired ? '❌ Expired' : '✅ Active'
+            renewalCount,
+            statusText:
+                isExpired
+                    ? '❌ Expired'
+                    : '✅ Active'
         });
 
         if (isExpired) {
             return res.status(403).json({
                 success: false,
-                message: 'Your trial has expired! Run the /panel command in Discord to renew.'
+                message:
+                    'Your trial has expired! Run /panel in Discord to renew it.'
             });
         }
 
         return res.json({
             success: true,
-            message: user.username,
+            message: 'Discord authentication successful.',
             user: {
                 id: user.id,
                 username: user.username,
+                trial_start: row.trial_start,
                 trial_expiry: trialExpiry.toISOString(),
                 renewal_count: renewalCount
             }
         });
 
     } catch (error) {
-        console.error("Auth Error:", error.response?.data || error.message);
-        return res.status(500).json({ 
-            success: false, 
-            message: 'Authentication failed.',
-            details: error.response?.data || error.message 
+        console.error(
+            'Discord Authentication Error:',
+            error.response?.data || error.message
+        );
+
+        return res.status(500).json({
+            success: false,
+            message:
+                error.response?.data?.error_description ||
+                error.response?.data?.message ||
+                error.message ||
+                'Authentication failed.'
         });
     }
 });
 
-// Sends webhook notification log to Discord channel
 async function sendLogWebhook(data) {
-    if (!WEBHOOK_URL) return;
+    if (!WEBHOOK_URL)
+        return;
+
     const embed = {
         title: "🔑 User Login Event",
-        color: data.statusText.includes('✅') ? 0x00FF00 : 0xFF0000,
+        color:
+            data.statusText.includes('✅')
+                ? 0x00FF00
+                : 0xFF0000,
+
         fields: [
-            { name: "User", value: `${data.username} (<@${data.discordId}>)`, inline: true },
-            { name: "Status", value: data.statusText, inline: true },
-            { name: "Last Login", value: data.lastLogin, inline: false },
-            { name: "Trial Expiry", value: data.trialExpiry, inline: true },
-            { name: "Renewals Used", value: `${data.renewalCount}`, inline: true },
-            { name: "Need Actions?", value: "Type `/panel` in the server to access the Control Panel menu!", inline: false }
+            {
+                name: "User",
+                value:
+                    `${data.username} (<@${data.discordId}>)`,
+                inline: true
+            },
+            {
+                name: "Status",
+                value: data.statusText,
+                inline: true
+            },
+            {
+                name: "Last Login",
+                value: data.lastLogin,
+                inline: false
+            },
+            {
+                name: "Trial Expiry",
+                value: data.trialExpiry,
+                inline: true
+            },
+            {
+                name: "Renewals Used",
+                value: `${data.renewalCount}`,
+                inline: true
+            }
         ],
+
         timestamp: new Date().toISOString()
     };
 
     try {
-        await axios.post(WEBHOOK_URL, { embeds: [embed] });
-    } catch (e) {
-        console.error("Webhook Error:", e.message);
+        await axios.post(
+            WEBHOOK_URL,
+            { embeds: [embed] },
+            { timeout: 10000 }
+        );
+    } catch (error) {
+        console.error(
+            "Webhook Error:",
+            error.message
+        );
     }
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
 
-// Load the Discord Bot alongside the Express server
-require('./bot.js');
+dbReady
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log(
+                `API running on port ${PORT}`
+            );
+        });
+
+        require('./bot.js');
+    })
+    .catch(error => {
+        console.error(
+            'Fatal database initialization error:',
+            error
+        );
+
+        process.exit(1);
+    });
